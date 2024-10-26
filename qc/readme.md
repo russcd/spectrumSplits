@@ -2,7 +2,7 @@
 These scripts provide automated QC for reducing the impacts of potentially spurious mutations. 
 
 ## prune_mutation_sample_ratio.py usage:
-usage: prune_mutation_sample_ratio.py [-h] [--input_tree INPUT_TREE] [--output_tree OUTPUT_TREE] [--threshold THRESHOLD]
+```usage: prune_mutation_sample_ratio.py [-h] [--input_tree INPUT_TREE] [--output_tree OUTPUT_TREE] [--threshold THRESHOLD]
 
 Process a phylogenetic tree for changepoint detection in mutation/descendant ratios.
 
@@ -14,9 +14,10 @@ options:
                         Output tree file (protobuf format)
   --threshold THRESHOLD
                         Mutation:Leaf Ratio to prune
+```
 
 ## mask_site_splits.py usage:
-usage: mask_site_splits.py [-h] [--input_tree INPUT_TREE] [--output_tree OUTPUT_TREE] [--min_total MIN_TOTAL] [--min_count MIN_COUNT] [--nthreads NTHREADS] [--mask_chi MASK_CHI]
+```usage: mask_site_splits.py [-h] [--input_tree INPUT_TREE] [--output_tree OUTPUT_TREE] [--min_total MIN_TOTAL] [--min_count MIN_COUNT] [--nthreads NTHREADS] [--mask_chi MASK_CHI]
 
 Process a phylogenetic tree to find splits, compute spectra, and get representative tips.
 
@@ -32,3 +33,4 @@ options:
                         Minimum mutation count to accept a split
   --nthreads NTHREADS   Number of concurrent threads for processing
   --mask_chi MASK_CHI   Minimum chi2 value for masking mutation below a node (defaults to off)
+```
