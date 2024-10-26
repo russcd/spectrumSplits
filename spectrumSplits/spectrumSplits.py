@@ -1,215 +1,284 @@
 import bte
 import sys
+import copy
+import csv 
+import random
 import argparse
-from scipy.stats import chi2_contingency
+import random
+from multiprocessing import Process
 from collections import defaultdict
-from multiprocessing import Process, Manager
-import re
+from scipy.stats import chi2_contingency
 
+# Command-line argument parsing
 def parse_args():
     parser = argparse.ArgumentParser(description="Process a phylogenetic tree to find splits, compute spectra, and get representative tips.")
     parser.add_argument("--input_tree", type=str, default="public-latest.all.masked.pb.gz", help="Input tree file (protobuf format)")
-    parser.add_argument("--output_tree", type=str, default="masked_sites.pb.gz", help="Output tree file (protobuf format)")
-    parser.add_argument("--min_total", type=int, default=500, help="Minimum mutation count to accept a split")
-    parser.add_argument("--min_count", type=int, default=50, help="Minimum mutation count to accept a split")
-    parser.add_argument("--nthreads", type=int, default=100, help="Number of concurrent threads for processing")
-    parser.add_argument("--mask_chi", type=float, default=5000, help="Minimum chi2 value for masking mutation below a node (defaults to off)")
+    parser.add_argument("--output_spectrum", type=str, default="spectra_output.tsv", help="Output TSV file for spectra")
+    parser.add_argument("--min_chi", type=float, default=500, help="Minimum Chi-square value to accept a split")
+    parser.add_argument("--min_mutations", type=int, default=500, help="Minimum number of mutations required for a split")
+    parser.add_argument("--ntips", type=int, default=5, help="Number of tips to retrieve for each split")
+    parser.add_argument("--bootstrap_splits", type=int, default=0, help="Number of bootstrap replicates to attempt in defining splits")
+    parser.add_argument("--bootstrap_spectra", type=int, default=0, help="Number of bootstrap replicates to attempt in defining spectra")
+    parser.add_argument("--nthreads", type=int, default=1, help="Number of threads for concurrent bootstrapping")
+    parser.add_argument("--max_branch_length", type=int, default=100000, help="Maximum branch length to include in spectrum calculations")
     return parser.parse_args()
 
-def get_position_from_mutation(mutation):
-    """
-    Extracts the position from a mutation string.
-    Mutation strings are of the form \D\d+\D, where \d+ is the numeric position.
-    """
-    match = re.search(r'\d+', mutation)
-    if match:
-        return int(match.group(0))  # Return the numeric part as an integer
-    return None
+### mutation positions 
+def get_positions( node ) :
+    positions = set() 
+    for mutation in node.mutations:
+        positions.add( int(mutation[1:-1]) )
+    for child in node.children :
+        positions.update( get_positions( child ) ) 
+    return positions 
 
-def get_mutation_counts(node):
-    mutation_counts = defaultdict(int)
+### create bootstrap weights by alignment position
+def create_bootstrap( positions, n_samples=None ) :
+    bootstrap_weights = defaultdict(int)  # Initialize a defaultdict to store counts
+    if n_samples is None:
+        n_samples = len(positions)  # Default to the size of the original set
+    positions_list = list(positions)  # Convert set to list for indexing
+    for _ in range(n_samples):
+        selected_position = random.choice(positions_list)
+        bootstrap_weights[selected_position] += 1
+    return dict(bootstrap_weights)
 
-    def traverse_tree(node):
-        for mutation in node.mutations:
-            position = get_position_from_mutation(mutation)
-            if position is not None:
-                mutation_counts[position] += 1
-        for child in node.children:
-            traverse_tree(child)
-
-    traverse_tree(node)
-    return dict(mutation_counts)
-
-def process_mutation(tree, position, count, total_mutations, args, mask_dict, chi_list):
-    """Process one mutation split."""
-    find_site_splits(position, count, total_mutations, tree.root, args, mask_dict, chi_list)
-
-def run_in_process(tree, position, count, total_mutations, args, mask_dict, chi_list):
-    """Helper function to run in a separate process."""
-    p = Process(target=process_mutation, args=(tree, position, count, total_mutations, args, mask_dict, chi_list))
-    p.start()
-    return p   
-
-def find_site_splits(position, mutation_count, total_mutations, root, args, mask_dict, chi_list):
-
-    mutation_memo = {}
-    total_memo = {}
-    max_chi = 0
-    max_node = root
-
-    def traverse_and_count(node):
-        nonlocal max_chi, max_node  # Declare that we want to modify the outer scope variables so we can do the recursion
-
-        if node.id in mutation_memo:
-            return mutation_memo[node.id], total_memo[node.id]
-
-        mutation_occurrences = 0
-        total_descendant_mutations = len(node.mutations)
-
-        for mutation in node.mutations:
-            if get_position_from_mutation(mutation) == position:
-                mutation_occurrences += 1
-
-        for child in node.children:
-            child_mutation_count, child_total_count = traverse_and_count(child)
-            mutation_occurrences += child_mutation_count
-            total_descendant_mutations += child_total_count
-
-        mutation_memo[node.id] = mutation_occurrences
-        total_memo[node.id] = total_descendant_mutations
-
-        snps_above = mutation_count - mutation_memo[node.id] 
-        total_above = total_mutations - total_memo[node.id] - snps_above
-
-        if total_above > args.min_total and total_memo[node.id] > args.min_total:
-            observed = [[total_above, snps_above], [total_memo[node.id]-mutation_memo[node.id], mutation_memo[node.id]]]
-            chi2, p, dof, expected = chi2_contingency(observed)
-
-            if chi2 > max_chi:
-                max_chi = chi2
-                max_node = node
-
-        return mutation_occurrences, total_descendant_mutations
-
-    traverse_and_count(root)
+def compute_mutation_spectrum(node, stop_nodes, spectrum_dict, weights=None, max_branch_length=100000):
+    if node in spectrum_dict:
+        return spectrum_dict[node]
     
-    # Add to mask_dict if max_chi exceeds the threshold
-    if max_chi > args.mask_chi:
-        current_nodes = mask_dict.get(max_node.id, [])  # Get the list if it exists, otherwise get an empty list
-        current_nodes.append(position)
-        mask_dict[max_node.id] = current_nodes  # Reassign the updated list back to the dictionary
+    local_spectrum = defaultdict(int)
+    for child in node.children:
+        if any(child.id == stop_node.id for stop_node in stop_nodes):
+            continue
+        child_spectrum = compute_mutation_spectrum(child, stop_nodes, spectrum_dict, weights, max_branch_length)
+        for mutation_type, count in child_spectrum.items():
+            local_spectrum[mutation_type] += count
 
-    # Append chi result to chi_list
-    chi_list.append((position, max_chi, max_node.id))
+    if len(node.mutations) <= max_branch_length :
+        for mutation in node.mutations:
+            char1 = mutation[0]
+            char2 = mutation[-1]
+            mutation_type = char1 + char2
+            pos = int(mutation[1:-1])
+            
+            # Assign weight 1 if weights is None; otherwise, check if pos is in weights dict and it gets that weigth or 0 otherwise
+            weight = weights.get(pos, 0) if weights else 1
+            local_spectrum[mutation_type] += weight
+    
+    spectrum_dict[node] = local_spectrum
+    return local_spectrum
 
-def mask_mutations(root, mask_dict):
-    """
-    Perform a DFS traversal of the tree and for each node in mask_dict,
-    remove the listed mutations from all descendant nodes using update_mutations.
-    """
-    def dfs(node):
-        if node.id in mask_dict:
-            positions_to_mask = mask_dict[node.id]
-            print(f"Masking mutations at positions {positions_to_mask} in descendants of node {node.id}", file = sys.stderr)
+def compute_spectrum_difference(spectrum1, spectrum2):
+    difference_spectrum = defaultdict(int)
+    all_keys = set(spectrum1.keys()).union(set(spectrum2.keys()))
+    for key in all_keys:
+        difference_spectrum[key] = abs(spectrum1.get(key, 0) - spectrum2.get(key, 0))
+    return difference_spectrum
 
-            # Recursively mask mutations in descendants
-            def remove_mutations(descendant):
-                # Create a set of positions of current mutations for the descendant
-                current_positions = set(get_position_from_mutation(m) for m in descendant.mutations)
-                # Calculate remaining positions after masking
-                remaining_positions = current_positions - set(positions_to_mask)
-                # Update the descendant's mutations with the remaining ones
-                remaining_mutations = [m for m in descendant.mutations if get_position_from_mutation(m) in remaining_positions]
-                descendant.update_mutations(remaining_mutations, update_branch_length=True)
+def subtract_spectra(spectrum1, spectrum2):
+    remainder_spectrum = copy.deepcopy(spectrum1)
+    for key, value in spectrum2.items():
+        if key in remainder_spectrum:
+            remainder_spectrum[key] -= value
+    return remainder_spectrum
 
-                # Continue removing mutations for each child of this descendant
-                for child in descendant.children:
-                    remove_mutations(child)
+def normalize_spectrum(d):
+    total = sum(d.values())
+    if total == 0:
+        raise ValueError("Cannot normalize because the total sum of values is 0.")
+    normalized_d = {key: val / total for key, val in d.items()}
+    return normalized_d
 
-            # Start masking from the children of the current node
-            for child in node.children:
-                remove_mutations(child)
+def get_spectra(finalized_splits, max_branch_length, weights=None):
+    final_spectra = {} 
+    for split_root in finalized_splits:
+        print(f"Computing spectrum for subtree beginning at {split_root.id}", file=sys.stderr)
+        spectrum_dict = {}
+        final_spectra[split_root] = compute_mutation_spectrum(split_root, finalized_splits, spectrum_dict, weights, max_branch_length)
+    return final_spectra
 
-        # Continue DFS to check children nodes
-        for child in node.children:
-            dfs(child)
+def write_spectra_to_tsv(spectra_dict, filename, ntips):
+    all_keys = set()
+    for spectrum in spectra_dict.values():
+        all_keys.update(spectrum.keys())
+    sorted_keys = sorted(all_keys)
+    with open(filename, "w", newline="") as file:
+        writer = csv.writer(file, delimiter='\t')
+        header = ["Node_ID"] + ["Total_Mutations"] + ["Number_Tips"] + ["Mutations:Tips"]+ sorted_keys + ["Exemplar tips"]
+        writer.writerow(header)
+        for node, spectrum in spectra_dict.items():
+            tips = get_tips( spectra_dict.keys(), node )
+            if ntips > 0 :
+                normalized_spectrum = normalize_spectrum(spectrum)
+                row = [node.id] + [sum(spectrum.values())] + [len(tips)] + [float(sum(spectrum.values()))/float(len(tips))] + [normalized_spectrum.get(key, 0) for key in sorted_keys] + [write_tips( tips, ntips )] 
+                writer.writerow(row)
+            else:
+                normalized_spectrum = normalize_spectrum(spectrum)
+                row = [node.id] + [sum(spectrum.values())] + [len(tips)] + [float(sum(spectrum.values()))/float(len(tips))] + [normalized_spectrum.get(key, 0) for key in sorted_keys]
+                writer.writerow(row)
+    print(f"Spectra written to {filename}", file=sys.stderr)
 
-    # Start the DFS traversal from the root node
-    dfs(root)
+def get_tips(splits, node):
+    tips = []
+    def traverse(current_node):
+        if current_node.is_leaf():
+            tips.append(current_node.id)
+        else:
+            for child in current_node.children:
+                if any(child.id == split.id for split in splits):
+                    continue
+                traverse(child)
+    traverse(node)
+    return tips
+
+def write_tips(tips, ntips):
+    if len(tips) == 0:
+        return
+    elif len(tips) < ntips:
+        return ','.join(tips)
+    else:
+        return ','.join(random.sample(tips, ntips))
+
+def find_splits(node, min_chi, min_mutations, max_branch_length, weights=None ):
+    accepted_splits = set({node})
+    finalized_splits = set()
+    while len(accepted_splits) > len(finalized_splits):
+        print(f"Starting iteration with {len(accepted_splits)-1} accepted splits and {len(finalized_splits)} finalized splits", file=sys.stderr)
+        new_split = set()
+        for splitRoot in accepted_splits:
+            if any(splitRoot.id == stop_node.id for stop_node in finalized_splits):
+                print(f"Finalized split skipped:  {splitRoot.id}", file=sys.stderr)
+                continue
+            print(f"Computing spectrum for subtree beginning at {splitRoot.id}", file=sys.stderr)
+            spectrum_dict = {}
+            split_root_spectrum = compute_mutation_spectrum(splitRoot, accepted_splits, spectrum_dict, weights, max_branch_length)
+            print(f"Computing distances between splits in (sub)tree {splitRoot.id}", file=sys.stderr)
+            max_chi = 0
+            max_chi_node = None
+            for node in spectrum_dict:
+                if sum(spectrum_dict[node].values()) < min_mutations:
+                    continue
+                if sum(split_root_spectrum.values()) - sum(spectrum_dict[node].values()) < min_mutations:
+                    continue
+                
+                splitroot_spectrum_list = []
+                above_spectrum_list = [] 
+                for mutation in ["AC","AG","AT","CA","CG","CT","GA","GC","GT","TA","TC","TG"] :
+                    if mutation in spectrum_dict[node].keys():
+                        splitroot_spectrum_list.append(spectrum_dict[node][mutation])
+                    else:
+                        # Append 0 if the mutation is missing from the spectrum
+                        splitroot_spectrum_list.append(0)
+                    
+                    if mutation in split_root_spectrum.keys():
+                        # Calculate the difference, but handle cases where mutation is missing from node
+                        above_spectrum_list.append(split_root_spectrum[mutation] - spectrum_dict[node].get(mutation, 0))
+                    else:
+                        # Append 0 if the mutation is missing from the split_root_spectrum
+                        above_spectrum_list.append(0)
+
+                chi, p, dof, expected = chi2_contingency([splitroot_spectrum_list,above_spectrum_list])
+
+                '''
+                node_spectrum_difference = compute_spectrum_difference(
+                    normalize_spectrum(spectrum_dict[node]),
+                    normalize_spectrum(subtract_spectra(split_root_spectrum, spectrum_dict[node]))
+                )
+                chi = sum(node_spectrum_difference.values()) * min(
+                    sum(spectrum_dict[splitRoot].values()) - sum(spectrum_dict[node].values()),
+                    sum(spectrum_dict[node].values())
+                )
+                '''
+                
+                if chi > max_chi:
+                    max_chi = chi
+                    max_chi_node = node
+            if max_chi > min_chi:
+                if max_chi_node and max_chi_node not in accepted_splits:
+                    new_split.add(max_chi_node)
+                    print(f"New split found at {max_chi_node.id} with x2 {max_chi}", file=sys.stderr)
+            else:
+                finalized_splits.add(splitRoot)
+                print(f"Finalized subtree rooted at {splitRoot.id}", file=sys.stderr)
+        accepted_splits = accepted_splits.union(new_split)
+        print(f"End of iteration: {len(new_split)} new splits added, {len(accepted_splits) -1} total accepted splits", file=sys.stderr)
+    return finalized_splits
+
+def bootstrap_replicate ( tree, replicate, min_chi, min_mutations, ntips, max_branch_length ) :
+    print(f"Begining bootstrap no: {replicate}", file=sys.stderr)
+    positions = get_positions( tree.root )
+    bootstrap_weights = create_bootstrap( positions )
+    finalized_splits_bootstrap = find_splits(tree.root, min_chi, min_mutations, max_branch_length, bootstrap_weights)
+    bootstrap_spectra = get_spectra(finalized_splits_bootstrap, max_branch_length, bootstrap_weights)
+    bootstrap_output_file = f"bootstrap_{replicate}_splits_output.tsv"
+    write_spectra_to_tsv(bootstrap_spectra, bootstrap_output_file, ntips)
+
+# Define the run_bootstrap function using explicit process creation
+def run_bootstrap(tree, nbootstraps, nthreads, min_chi, min_mutations, max_branch_length):
+    processes = []
+    # Create and start a process for each bootstrap replicate
+    for replicate in range(1, nbootstraps + 1):
+        p = Process(target=bootstrap_replicate, args=(tree, replicate, min_chi, min_mutations, 0, max_branch_length))
+        processes.append(p)
+        p.start()
+        # If we have reached the maximum number of threads, wait for them to finish
+        if len(processes) >= nthreads:
+            for p in processes:
+                p.join()
+            processes = []
+    # Wait for any remaining processes to finish
+    for p in processes:
+        p.join()
+
+    print(f"Bootstrap completed with {nbootstraps} replicates using {nthreads} threads.")
+
+def bootstrap_spectrum_replicate( tree, replicate, splits, max_branch_lengths):
+    print(f"Begining bootstrap no: {replicate}", file=sys.stderr)
+    positions = get_positions( tree.root )
+    bootstrap_weights = create_bootstrap( positions )
+    bootstrap_spectra = get_spectra( splits, max_branch_lengths, bootstrap_weights)
+    bootstrap_output_file = f"bootstrap_{replicate}_spectra_output.tsv"
+    write_spectra_to_tsv(bootstrap_spectra, bootstrap_output_file, 0)
+
+### ok, botostrap by spectrum
+def run_bootstrap_spectra( tree, nbootstraps, nthreads, splits, max_branch_lengths ) :
+    processes = []
+    # Create and start a process for each bootstrap replicate
+    for replicate in range(1, nbootstraps + 1):
+        p = Process(target=bootstrap_spectrum_replicate, args=(tree, replicate, splits, max_branch_lengths))
+        processes.append(p)
+        p.start()
+        # If we have reached the maximum number of threads, wait for them to finish
+        if len(processes) >= nthreads:
+            for p in processes:
+                p.join()
+            processes = []
+    # Wait for any remaining processes to finish
+    for p in processes:
+        p.join()
+    print(f"Bootstrap spectrum completed with {nbootstraps} replicates using {nthreads} threads.")
 
 def main():
+
+    ### read args and tree
     args = parse_args()
     tree = bte.MATree(args.input_tree)
 
-    # Get mutation counts
-    mutation_counts = get_mutation_counts(tree.root)
+    ### go through and do the real run without weighting mutations 
+    finalized_splits = find_splits(tree.root, args.min_chi, args.min_mutations, args.max_branch_length )
+    spectra = get_spectra(finalized_splits, args.max_branch_length )
+    write_spectra_to_tsv(spectra, args.output_spectrum, args.ntips)
 
-    print("Counting mutations", file=sys.stderr)
-    total_mutations = sum(mutation_counts.values())
-    
-    # Prune mutations with fewer occurrences than the minimum count
-    mutation_counts = {k: v for k, v in mutation_counts.items() if v >= args.min_count}
+    ### get bootstrap splits if requested
+    if ( args.bootstrap_splits > 0 ) :
+        print(f"Bootstrapping splits with {args.bootstrap_splits} replicates using {args.nthreads} threads.", file=sys.stderr)
+        run_bootstrap( tree, args.bootstrap_splits, args.nthreads, args.min_chi, args.min_mutations, args.max_branch_length )
 
-    ## iteratively check for unbalanced splits
-    iteration = 1
-    while len(mutation_counts.keys()) > 0 :
-        print(f"Finding splits. Iteration no: {iteration}", file=sys.stderr)
-    
-        # Use Manager to create shared data structures
-        manager = Manager()
-        mask_dict = manager.dict()  # Shared dictionary for storing mutations and node_ids
-        chi_list = manager.list()  # Shared list for storing chi results
-
-        # Limit the number of concurrent processes
-        processes = []
-        for position, count in mutation_counts.items():
-
-            print(f"\tPosition: {position}\tOccurrences: {count}", file=sys.stderr)
-            
-            # Start a new process for each mutation
-            p = run_in_process(tree, position, count, total_mutations, args, mask_dict, chi_list)
-            processes.append(p)
-            
-            # Ensure we don't exceed the specified number of threads
-            if len(processes) >= args.nthreads:
-                for proc in processes:
-                    proc.join()
-                processes = []  # Reset the list after joining
-
-        # Wait for remaining processes to finish
-        for proc in processes:
-            proc.join()
-
-        # Print mutations with chi-square values exceeding mask_chi
-        print(f"Mutations checked: ", file=sys.stderr)
-        for position, chi, node_id in sorted(chi_list, key=lambda x: -x[1]):
-            print(f"{position}\t{chi}\t{node_id}", file=sys.stderr)
-        
-        # Mask mutations if mask_chi is greater than 0
-        if args.mask_chi > 0 and len( mask_dict.keys() ) > 0 :
-            print("Masking mutations: ", len(mask_dict.keys()), file=sys.stderr)
-            mask_mutations(tree.root, mask_dict)
-        
-            print("Recounting mutations", file=sys.stderr)
-            mutation_counts = get_mutation_counts(tree.root)
-
-            # Flatten the mutation positions from mask_dict into a single set for faster lookup
-            masked_positions = set(pos for mutations in mask_dict.values() for pos in mutations)
-
-            # Filter mutation_counts based on whether they are present in the flattened mask positions
-            filtered_counts = {k: v for k, v in mutation_counts.items() if k in masked_positions}
-
-            print("Filtered mutation counts:", filtered_counts, file=sys.stderr)
-            print("Sites to recheck: ", len(filtered_counts.keys()), file=sys.stderr)
-            mutation_counts = filtered_counts
-
-        else :
-            mutation_counts = {}
-
-        iteration += 1
-
-    print("Saving tree to: ", args.output_tree, file=sys.stderr)
-    tree.save_pb(args.output_tree)  # Use the BTE library's method to save the modified tree
+    ### bootstrap spectrum requested:
+    if ( args.bootstrap_spectra > 0 ) :
+        print(f"Bootstrapping spectra with {args.bootstrap_spectra} replicates using {args.nthreads} threads.", file=sys.stderr)
+        run_bootstrap_spectra( tree, args.bootstrap_spectra, args.nthreads, finalized_splits, args.max_branch_length )
 
 if __name__ == "__main__":
     main()
