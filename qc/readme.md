@@ -1,5 +1,5 @@
 # Automated qc tools
-These scripts provide automated QC for reducing the impacts of potentially spurious mutations. 
+These scripts provide automated QC for reducing the impacts of potentially spurious mutations and samples. 
 
 ## prune_mutation_sample_ratio.py usage:
 ```usage: prune_mutation_sample_ratio.py [-h] [--input_tree INPUT_TREE] [--output_tree OUTPUT_TREE] [--threshold THRESHOLD]
