@@ -7,7 +7,7 @@ from multiprocessing import Process, Manager
 import re
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Process a phylogenetic tree to find splits, compute spectra, and get representative tips.")
+    parser = argparse.ArgumentParser(description="Process a phylogenetic tree to mask highly imbalanced mutations.")
     parser.add_argument("--input_tree", type=str, default="public-latest.all.masked.pb.gz", help="Input tree file (protobuf format)")
     parser.add_argument("--output_tree", type=str, default="masked_sites.pb.gz", help="Output tree file (protobuf format)")
     parser.add_argument("--min_total", type=int, default=500, help="Minimum mutation count to accept a split")
