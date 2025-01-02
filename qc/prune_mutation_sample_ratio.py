@@ -13,37 +13,30 @@ def parse_args():
 
 # Compute the mutation-to-descendant ratio for each node and store it
 def compute_descendants_mutations_ratio(node, mutation_ratio):
-    # Base case: If node is a tip (no children), count it as one descendant
-    if not node.children:
+    if not node.children:  # Base case: If node is a tip (no children)
         mutation_ratio[node.id] = len(node.mutations) / 1  # 1 because it's a tip itself
-        return 1, len(node.mutations)
+        return 1, len(node.mutations), [node.id]  # Return the tip count and mutations
 
     total_tips = 0
     total_mutations = len(node.mutations)
+    descendant_tips = []
 
-    # Recursive case: Traverse children to count tips and mutations
-    for child in node.children:
-        child_tips, child_mutations = compute_descendants_mutations_ratio(child, mutation_ratio)
-        total_tips += child_tips  # Only count tips
+    for child in node.children:  # Recursive case
+        child_tips, child_mutations, child_descendant_tips = compute_descendants_mutations_ratio(child, mutation_ratio)
+        total_tips += child_tips
         total_mutations += child_mutations
+        descendant_tips.extend(child_descendant_tips)
 
-    # Calculate the mutation-to-tip ratio
-    if total_tips > 0:
-        ratio = total_mutations / total_tips
-    else:
-        ratio = float('inf')  # Handle case if somehow there are no tips
-
-    # Store the ratio for this node
+    ratio = total_mutations / total_tips if total_tips > 0 else float('inf')
     mutation_ratio[node.id] = ratio
 
-    return total_tips, total_mutations  # Only return the number of tips
+    return total_tips, total_mutations, descendant_tips
 
 # Traverse the tree and detect changepoints based on mutation/descendant ratio changes
 def detect_changepoints(node, mutation_ratio, threshold, changepoints, to_prune):
     for child in node.children:
         if mutation_ratio[child.id] >= threshold:
-            changepoints.append((node.id, child.id, mutation_ratio[child.id]))
-            # Mark this child for removal
+            changepoints.append((node.id, child.id, mutation_ratio[child.id], child))
             to_prune.add(child)
             continue
         detect_changepoints(child, mutation_ratio, threshold, changepoints, to_prune)
@@ -51,12 +44,22 @@ def detect_changepoints(node, mutation_ratio, threshold, changepoints, to_prune)
 # Determine the threshold based on the overall distribution of ratios
 def compute_threshold(mutation_ratios):
     ratios = np.array(list(mutation_ratios.values()))
-    return np.mean(ratios) + np.std(ratios) * 2  ### seems reasonable, all in all, but probably will be a low number in general. 
+    return np.mean(ratios) + np.std(ratios) * 2
 
 # Function to prune marked nodes from the tree
 def prune_tree(tree, to_prune):
-    for node in to_prune :
+    for node in to_prune:
         tree.remove_node(node.id)
+
+# Helper function to get all descendant tips of a node
+def get_descendant_tips(node):
+    if not node.children:  # Base case: If node is a tip
+        return [node.id]
+
+    tips = []
+    for child in node.children:
+        tips.extend(get_descendant_tips(child))
+    return tips
 
 def main():
     args = parse_args()
@@ -65,23 +68,21 @@ def main():
     mutation_ratio = {}
     compute_descendants_mutations_ratio(tree.root, mutation_ratio)
 
-    ## compute it from this
-    if args.threshold == 0 :
+    if args.threshold == 0:
         args.threshold = compute_threshold(mutation_ratio)
 
     changepoints = []
-    to_prune = set()  # Set for nodes to be removed
+    to_prune = set()
     detect_changepoints(tree.root, mutation_ratio, args.threshold, changepoints, to_prune)
 
-    print("Changepoints Detected:")
-    for parent_id, child_id, ratio in changepoints:
-        print(f"Parent {parent_id}, Child {child_id}, Ratio of Child: {ratio}")
+    print("#Parent\tchild\ttips\tmutations:tips")
+    for parent_id, child_id, ratio, child_node in changepoints:
+        descendant_tips = get_descendant_tips(child_node)
+        tips_str = ",".join(descendant_tips) if descendant_tips else ""
+        print(f"{parent_id}\t{child_id}\t{tips_str}\t{ratio}")
 
-    # Prune the marked nodes from the tree
     prune_tree(tree, to_prune)
-
-    # Save the modified tree to the output file
-    tree.save_pb(args.output_tree)  # Use the BTE library's method to save the modified tree
+    tree.save_pb(args.output_tree)
 
 if __name__ == "__main__":
     main()
