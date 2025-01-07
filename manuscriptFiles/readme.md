@@ -1,4 +1,5 @@
-# This directory contains two files supplemental to our manuscript that are too large to be included as supplemental materials,. 
+## Contents 
+This directory contains two files supplemental to our manuscript that are too large to be included as supplemental materials.
 
 ## Files
 
